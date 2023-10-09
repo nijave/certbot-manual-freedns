@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"github.com/ramalhais/go-freedns"
 	"go.uber.org/zap"
@@ -13,7 +12,7 @@ import (
 	"time"
 )
 
-const DefaultConfigFile = "/etc/freedns.yaml"
+// FreeTtlValue Value taken from the FreeDNS website form
 const FreeTtlValue = "For our premium supporters"
 
 type DnsHost interface {
@@ -197,14 +196,6 @@ func main() {
 		panic(err)
 	}
 	sugar := logger.Sugar()
-
-	var configFile string
-	flag.StringVar(&configFile, "config-file", "", "path to config file")
-	flag.Parse()
-
-	if configFile == "" {
-		configFile = DefaultConfigFile
-	}
 
 	challengeDomain := requireEnv("CERTBOT_DOMAIN")
 	recordValue := requireEnv("CERTBOT_VALIDATION")

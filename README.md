@@ -20,3 +20,10 @@ Renews certificates using DNS challenge against FreeDNS
       -d example.com
     ```
 4. Enable auto renewal `systemctl enable --now snap.certbot.renew.timer`
+
+## Testing
+A manual shell script test is provided that hits certbot staging API to issue test certificates.
+```bash
+go build .
+./certbot-test.sh me@example.com example.com
+```
