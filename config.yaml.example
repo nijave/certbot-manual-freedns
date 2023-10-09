@@ -1,0 +1,3 @@
+auth:
+  login: my-username
+  password: my-Secret-Password
