@@ -47,6 +47,3 @@ signs:
 
 release:
   draft: true
-
-changelog:
-  skip: true
