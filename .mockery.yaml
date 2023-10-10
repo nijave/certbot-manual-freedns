@@ -1,0 +1,5 @@
+packages:
+  "github.com/nijave/certbot-manual-freedns":
+    interfaces:
+      main_DnsHost:
+      main_TxtResolver:

@@ -27,3 +27,10 @@ A manual shell script test is provided that hits certbot staging API to issue te
 go build .
 ./certbot-test.sh me@example.com example.com
 ```
+
+## Development
+### Update mocks
+```bash
+go install github.com/vektra/mockery/v2@v2.35.3
+mockery
+```
