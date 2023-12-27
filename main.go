@@ -15,6 +15,8 @@ import (
 // FreeTtlValue Value taken from the FreeDNS website form
 const FreeTtlValue = "For our premium supporters"
 
+const DeleteRecordNotFoundMessage = "couldn't find record to delete"
+
 type DnsHost interface {
 	GetDomains() (map[string]string, map[string]string, error)
 	GetRecords(string) (map[string]freedns.Record, error)
@@ -39,6 +41,7 @@ type DnsChallenge struct {
 	Timeout         time.Duration
 	resolveTimeout  time.Duration
 	retryTimeout    time.Duration
+	ctx             context.Context
 }
 
 func requireEnv(name string) string {
@@ -59,17 +62,49 @@ func getZoneFor(zones []string, domain string) string {
 	return zone
 }
 
-func stringStartsWith(str string, prefixes []string) bool {
-	str = strings.TrimPrefix(str, " ")
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(str, prefix) {
-			return true
-		}
+func (c *DnsChallenge) setup() error {
+	var ctx context.Context
+	if c.Timeout > 0 {
+		var ctxCancel func()
+		ctx, ctxCancel = context.WithTimeout(context.Background(), c.Timeout)
+		defer ctxCancel()
+	} else {
+		ctx = context.Background()
 	}
-	return false
+	c.ctx = ctx
+
+	domains, _, err := c.dnsHost.GetDomains()
+	if err != nil {
+		return err
+	}
+
+	// TODO not sure if these are used correctly...
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
+	}
+
+	zones := make([]string, len(domains))
+	for domain := range domains {
+		zones = append(zones, domain)
+	}
+
+	challengeDomainZone := getZoneFor(zones, c.ChallengeDomain)
+	if challengeDomainZone == "" {
+		return errors.New("couldn't find zone for domain")
+	}
+	c.LastZoneId = domains[challengeDomainZone]
+	c.Log.Infow("found zone", "zoneName", challengeDomainZone, "zoneId", c.LastZoneId)
+
+	c.LastRecordName = "_acme-challenge"
+	if challengeDomainZone != c.ChallengeDomain {
+		c.LastRecordName += "." + strings.TrimSuffix(c.ChallengeDomain, "."+challengeDomainZone)
+	}
+	c.LastRecordFQDN = fmt.Sprintf("%s.%s", c.LastRecordName, challengeDomainZone)
+
+	return nil
 }
 
-func (c *DnsChallenge) waitForPropagation(ctx context.Context) error {
+func (c *DnsChallenge) waitForPropagation() error {
 	if c.resolver == nil {
 		c.resolver = &net.Resolver{
 			PreferGo: true,
@@ -93,7 +128,7 @@ func (c *DnsChallenge) waitForPropagation(ctx context.Context) error {
 
 	// Seems like this usually takes ~50 seconds
 	for i := 0; i < 30; i++ {
-		timeout, timeoutCancel := context.WithTimeout(ctx, c.resolveTimeout)
+		timeout, timeoutCancel := context.WithTimeout(c.ctx, c.resolveTimeout)
 		records, err := c.resolver.LookupTXT(timeout, c.LastRecordFQDN)
 		timeoutCancel()
 		if err != nil && strings.HasSuffix(err.Error(), "no such host") {
@@ -110,9 +145,9 @@ func (c *DnsChallenge) waitForPropagation(ctx context.Context) error {
 		// https://stackoverflow.com/a/69291047/2751619
 		timer := time.NewTimer(c.retryTimeout)
 		select {
-		case <-ctx.Done():
+		case <-c.ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return c.ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -121,72 +156,35 @@ func (c *DnsChallenge) waitForPropagation(ctx context.Context) error {
 }
 
 func (c *DnsChallenge) Create() error {
-	var ctx context.Context
-	if c.Timeout > 0 {
-		var ctxCancel func()
-		ctx, ctxCancel = context.WithTimeout(context.Background(), c.Timeout)
-		defer ctxCancel()
-	} else {
-		ctx = context.Background()
-	}
-
-	domains, _, err := c.dnsHost.GetDomains()
+	err := c.setup()
 	if err != nil {
 		return err
 	}
 
-	// TODO not sure if these are used correctly...
-	if ctx.Err() != nil {
-		return ctx.Err()
+	err = c.Delete()
+	if err != nil && err.Error() != DeleteRecordNotFoundMessage {
+		return err
 	}
 
-	zones := make([]string, len(domains))
-	for domain := range domains {
-		zones = append(zones, domain)
-	}
-
-	challengeDomainZone := getZoneFor(zones, c.ChallengeDomain)
-	if challengeDomainZone == "" {
-		return errors.New("couldn't find zone for domain")
-	}
-	c.LastZoneId = domains[challengeDomainZone]
-	c.Log.Infow("found zone", "zoneName", challengeDomainZone, "zoneId", c.LastZoneId)
-
-	c.LastRecordName = "_acme-challenge"
-	if challengeDomainZone != c.ChallengeDomain {
-		c.LastRecordName += "." + strings.TrimSuffix(c.ChallengeDomain, "."+challengeDomainZone)
-	}
-	c.LastRecordFQDN = fmt.Sprintf("%s.%s", c.LastRecordName, challengeDomainZone)
 	c.Log.Infow("creating dns challenge", "name", c.LastRecordName, "value", c.ChallengeValue)
 
 	challengeRecord := fmt.Sprintf("\"%s\"", c.ChallengeValue)
 	err = c.dnsHost.CreateRecord(c.LastZoneId, c.LastRecordName, "TXT", challengeRecord, FreeTtlValue)
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	// Some retry-able errors. Capacity limit is a free-account edge case where an existing challenge may exist and deleting it frees up enough capacity to recreate it
-	if err != nil && stringStartsWith(err.Error(), []string{"You already have another already existent", "You have no more subdomain capacity allocated"}) {
-		c.Log.Warn("existing challenge. Deleting and retrying creation")
-		deleteErr := c.Delete()
-		if deleteErr != nil {
-			c.Log.Error(deleteErr)
-		}
-		// TODO maybe this should wait for the TTL to retry (that'd be an hour though...)
-		err = c.dnsHost.CreateRecord(c.LastZoneId, c.LastRecordName, "TXT", challengeRecord, FreeTtlValue)
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
 	}
 
 	if err != nil {
 		return err
 	}
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if c.ctx.Err() != nil {
+		return c.ctx.Err()
 	}
 
 	// It doesn't seem like certbot will wait around--it will insta-fail if there's NXDOMAIN
 	// Try to find the record first before returning to certbot
-	err = c.waitForPropagation(ctx)
+	err = c.waitForPropagation()
 
 	return err
 }
@@ -200,13 +198,17 @@ func (c *DnsChallenge) Delete() error {
 	recordIds, ok := c.dnsHost.FindRecordIds(records, c.LastRecordFQDN)
 	c.Log.Infow("found records to delete", "recordIds", recordIds)
 	if !ok {
-		return errors.New("couldn't find record to delete")
-	}
-	if len(recordIds) != 1 {
-		return errors.New("expected to find a single record")
+		return errors.New(DeleteRecordNotFoundMessage)
 	}
 
-	return c.dnsHost.DeleteRecord(recordIds[0])
+	for _, recordId := range recordIds {
+		err = c.dnsHost.DeleteRecord(recordId)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func runChallenger(challengeDomain, recordValue, authScriptOutput string, sugar *zap.SugaredLogger) error {
